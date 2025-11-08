@@ -5,6 +5,16 @@ __pycache__/
 
 # C extensions
 *.so
+dist/*
+build/*
+.venv/*
+ffmpeg-8.0/ 
+ffmpeg-8.0-essentials_build
+
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
+*.zip
 
 # Distribution / packaging
 .Python
