@@ -22,6 +22,38 @@ def format_size(num_bytes):
 GPU_ENCODER = 'h264_amf' 
 # หาก h264_amf ไม่ทำงาน อาจต้องลอง h264_qsv (Intel) หรือ h264_nvenc (NVIDIA) แทน
 
+# --- Preset การตั้งค่า ---
+PRESETS = {
+    "เร็วที่สุด (Fast)": {
+        "quality": "speed",
+        "rc": "vbr_latency",
+        "usage": "ultralowlatency",
+        "preanalysis": "0",
+        "hwaccel": "auto"
+    },
+    "สมดุล (Balanced)": {
+        "quality": "balanced",
+        "rc": "vbr_peak",
+        "usage": "transcoding",
+        "preanalysis": "1",
+        "hwaccel": "auto"
+    },
+    "คุณภาพสูง (Quality)": {
+        "quality": "quality",
+        "rc": "vbr_peak",
+        "usage": "transcoding",
+        "preanalysis": "1",
+        "hwaccel": "auto"
+    },
+    "พื้นฐาน (Basic)": {
+        "quality": None,
+        "rc": None,
+        "usage": None,
+        "preanalysis": None,
+        "hwaccel": "auto"
+    }
+}
+
 # --- หาตำแหน่ง ffmpeg และ ffprobe ---
 def find_ffmpeg_path():
     """ค้นหา ffmpeg ในโฟลเดอร์โปรแกรมก่อน ถ้าไม่มีใช้จาก system PATH"""
@@ -94,10 +126,18 @@ def get_video_bitrate(video_path):
         return None
 
 # --- ฟังก์ชันประมวลผลวิดีโอเดียว (รันใน Thread) ---
-def process_single_video(input_path, output_folder, bitrate_reduction_percent, message_queue=None):
+def process_single_video(input_path, output_folder, bitrate_reduction_percent, message_queue=None, stop_event=None, encoding_settings=None):
     """ประมวลผลไฟล์เดียวและรายงานความคืบหน้าผ่าน message_queue (ถ้ามี)"""
     filename = os.path.basename(input_path)
     file_ext = pathlib.Path(filename).suffix.lower()
+    
+    # ใช้ค่า default ถ้าไม่ได้ส่ง encoding_settings มา
+    if encoding_settings is None:
+        encoding_settings = PRESETS["พื้นฐาน (Basic)"]
+    
+    # ตรวจสอบว่าถูกสั่งหยุดหรือไม่
+    if stop_event and stop_event.is_set():
+        return f"⚠️ ยกเลิก: {filename}"
 
     video_extensions = ['.mp4', '.mov', '.mkv', '.avi', '.webm', '.flv']
     if not os.path.isfile(input_path) or file_ext not in video_extensions:
@@ -149,19 +189,44 @@ def process_single_video(input_path, output_folder, bitrate_reduction_percent, m
     output_filename = filename
     output_path = os.path.join(output_folder, output_filename)
 
-    # คำสั่ง FFmpeg พร้อม progress ผ่าน pipe:1
+    # สร้างคำสั่ง FFmpeg พื้นฐาน
     command = [
         FFMPEG_PATH,
-        '-y',
+        '-y'
+    ]
+    
+    # เพิ่ม hwaccel ถ้ามี
+    if encoding_settings.get("hwaccel"):
+        command.extend(['-hwaccel', encoding_settings["hwaccel"]])
+    
+    command.extend([
         '-i', input_path,
         '-c:v', GPU_ENCODER,
         '-b:v', new_bitrate_kbs,
-        '-rc', 'cbr',
+        '-maxrate', new_bitrate_kbs,
+        '-bufsize', f"{new_bitrate_bps * 2 // 1000}k"
+    ])
+    
+    # เพิ่ม advanced options ถ้ามี
+    if encoding_settings.get("quality"):
+        command.extend(['-quality', encoding_settings["quality"]])
+    
+    if encoding_settings.get("rc"):
+        command.extend(['-rc', encoding_settings["rc"]])
+    
+    if encoding_settings.get("usage"):
+        command.extend(['-usage', encoding_settings["usage"]])
+    
+    if encoding_settings.get("preanalysis"):
+        command.extend(['-preanalysis', encoding_settings["preanalysis"]])
+    
+    # เพิ่ม audio และ progress
+    command.extend([
         '-c:a', 'copy',
         '-progress', 'pipe:1',
         '-nostats',
         output_path
-    ]
+    ])
 
     try:
         # บันทึกขนาดไฟล์ต้นฉบับก่อนเริ่ม
@@ -185,6 +250,15 @@ def process_single_video(input_path, output_folder, bitrate_reduction_percent, m
         last_percent = -1
         if proc.stdout:
             for raw_line in proc.stdout:
+                # ตรวจสอบว่าถูกสั่งหยุดหรือไม่
+                if stop_event and stop_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return f"⚠️ ยกเลิก: {filename}"
+                
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -267,8 +341,12 @@ def process_single_video(input_path, output_folder, bitrate_reduction_percent, m
         return "❌ Error: ไม่พบ FFmpeg! กรุณาติดตั้ง FFmpeg และเพิ่มใน PATH\nดาวน์โหลดได้ที่: https://ffmpeg.org/download.html"
 
 # --- ฟังก์ชันหลักสำหรับ GUI (จัดการการประมวลผล) ---
-def start_conversion(input_folder, output_folder, reduction_percent, max_workers, message_queue):
+def start_conversion(input_folder, output_folder, reduction_percent, max_workers, message_queue, stop_event=None, encoding_settings=None):
     """ฟังก์ชันที่ถูกเรียกเมื่อกดปุ่มเริ่มแปลง - รันใน Background Thread"""
+    
+    # ใช้ค่า default ถ้าไม่ได้ส่ง encoding_settings มา
+    if encoding_settings is None:
+        encoding_settings = PRESETS["พื้นฐาน (Basic)"]
     
     # Require input folder to exist. Output folder will be created automatically if missing.
     if not os.path.isdir(input_folder):
@@ -310,10 +388,19 @@ def start_conversion(input_folder, output_folder, reduction_percent, max_workers
     # รวบรวมรายการไฟล์ที่ต้องประมวลผล
     input_files = []
     video_extensions = ['.mp4', '.mov', '.mkv', '.avi', '.webm', '.flv']
-    for filename in os.listdir(input_folder):
-        input_path = os.path.join(input_folder, filename)
-        if os.path.isfile(input_path) and pathlib.Path(filename).suffix.lower() in video_extensions:
-            input_files.append(input_path)
+    
+    # ตรวจสอบว่า input_folder เป็นไฟล์หรือโฟลเดอร์
+    if os.path.isfile(input_folder):
+        # ถ้าเป็นไฟล์ ให้ใช้ไฟล์นั้นเลย
+        if pathlib.Path(input_folder).suffix.lower() in video_extensions:
+            input_files.append(input_folder)
+            input_folder = os.path.dirname(input_folder)  # ใช้ parent folder
+    else:
+        # ถ้าเป็นโฟลเดอร์ ให้ค้นหาไฟล์ทั้งหมด
+        for filename in os.listdir(input_folder):
+            input_path = os.path.join(input_folder, filename)
+            if os.path.isfile(input_path) and pathlib.Path(filename).suffix.lower() in video_extensions:
+                input_files.append(input_path)
 
     if not input_files:
         message_queue.put(("text", f"ไม่พบไฟล์วิดีโอใน: {input_folder}\n", None))
@@ -331,8 +418,11 @@ def start_conversion(input_folder, output_folder, reduction_percent, max_workers
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for input_path in input_files:
+            # ตรวจสอบว่าถูกสั่งหยุดก่อนส่งงานใหม่
+            if stop_event and stop_event.is_set():
+                break
             # ส่ง message_queue ให้ worker เพื่อรายงานความคืบหน้า
-            future = executor.submit(process_single_video, input_path, output_folder, reduction_percent, message_queue)
+            future = executor.submit(process_single_video, input_path, output_folder, reduction_percent, message_queue, stop_event, encoding_settings)
             futures[future] = input_path
 
         # เก็บผลลัพธ์เมื่อแต่ละงานเสร็จ (as_completed จะให้ผลเมื่อเสร็จทีละงาน)
@@ -408,6 +498,15 @@ class VideoConverterApp:
         self.message_queue = queue.Queue()
         self.is_processing = False
         self.conversion_thread = None
+        self.stop_event = threading.Event()  # สำหรับยกเลิกการทำงาน
+        self.active_files = []  # เก็บรายการไฟล์ที่กำลังทำงาน
+        
+        # ตั้งค่า Encoding
+        self.preset_var = tk.StringVar(value="พื้นฐาน (Basic)")
+        self.current_encoding_settings = PRESETS["พื้นฐาน (Basic)"]
+        
+        # ตั้งค่าการปิดโปรแกรม
+        master.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # --- UI Elements ---
         
@@ -415,10 +514,11 @@ class VideoConverterApp:
         frame1 = tk.LabelFrame(master, text="โฟลเดอร์", padx=10, pady=10)
         frame1.pack(padx=10, pady=5, fill="x")
 
-        # Input Folder
-        tk.Label(frame1, text="Input Folder:").grid(row=0, column=0, sticky="w", pady=2)
+        # Input Folder or File
+        tk.Label(frame1, text="Input Folder/File:").grid(row=0, column=0, sticky="w", pady=2)
         tk.Entry(frame1, textvariable=self.input_folder, width=50).grid(row=0, column=1, padx=5, pady=2)
-        tk.Button(frame1, text="Browse", command=lambda: self.browse_folder(self.input_folder)).grid(row=0, column=2, padx=5, pady=2)
+        tk.Button(frame1, text="Browse Folder", command=lambda: self.browse_folder(self.input_folder)).grid(row=0, column=2, padx=2, pady=2)
+        tk.Button(frame1, text="Browse File", command=lambda: self.browse_file(self.input_folder)).grid(row=0, column=3, padx=2, pady=2)
 
         # Output Folder
         tk.Label(frame1, text="Output Folder:").grid(row=1, column=0, sticky="w", pady=2)
@@ -437,10 +537,19 @@ class VideoConverterApp:
         tk.Label(frame2, text="จำนวนไฟล์พร้อมกัน:").grid(row=1, column=0, sticky="w", pady=2)
         tk.Entry(frame2, textvariable=self.max_workers, width=10).grid(row=1, column=1, padx=5, pady=2, sticky="w")
         
+        # Encoding Preset
+        tk.Label(frame2, text="โหมดการแปลง:").grid(row=2, column=0, sticky="w", pady=2)
+        preset_combo = ttk.Combobox(frame2, textvariable=self.preset_var, values=list(PRESETS.keys()), state="readonly", width=20)
+        preset_combo.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+        preset_combo.bind("<<ComboboxSelected>>", self.on_preset_change)
+        
+        # ปุ่มตั้งค่าขั้นสูง
+        tk.Button(frame2, text="⚙️ ตั้งค่าขั้นสูง", command=self.open_advanced_settings).grid(row=2, column=2, padx=5, pady=2, sticky="w")
+        
         # แสดงสถานะ FFmpeg
         ffmpeg_status = "✅ พร้อมใช้งาน" if os.path.exists(FFMPEG_PATH) or FFMPEG_PATH == 'ffmpeg' else "❌ ไม่พบ"
-        tk.Label(frame2, text=f"FFmpeg: {ffmpeg_status}").grid(row=2, column=0, sticky="w", pady=2)
-        tk.Label(frame2, text=f"GPU Encoder: {GPU_ENCODER}").grid(row=2, column=1, sticky="w", pady=2)
+        tk.Label(frame2, text=f"FFmpeg: {ffmpeg_status}").grid(row=3, column=0, sticky="w", pady=2)
+        tk.Label(frame2, text=f"GPU Encoder: {GPU_ENCODER}").grid(row=3, column=1, sticky="w", pady=2)
         
         # Frame 3: Start Button & Status
         frame3 = tk.Frame(master, padx=10, pady=10)
@@ -451,16 +560,43 @@ class VideoConverterApp:
                   command=self.execute_conversion, 
                   font=("Helvetica", 12, "bold"),
                   bg="green", fg="white")
-        self.start_button.pack(pady=10, fill="x")
+        self.start_button.pack(pady=5, fill="x")
+        
+        # Cancel Button
+        self.cancel_button = tk.Button(frame3, text="ยกเลิก (Cancel)", 
+                  command=self.cancel_conversion, 
+                  font=("Helvetica", 10),
+                  bg="red", fg="white", state=tk.DISABLED)
+        self.cancel_button.pack(pady=5, fill="x")
+        
         # Overall Progress
         tk.Label(frame3, text="Overall Progress:").pack(pady=5, anchor="w")
         self.overall_progress = ttk.Progressbar(frame3, orient='horizontal', length=400, mode='determinate')
         self.overall_progress.pack(fill="x", padx=5)
 
-        # Per-file progress container
-        tk.Label(frame3, text="ความคืบหน้าของแต่ละไฟล์:").pack(pady=5, anchor="w")
-        self.files_container = tk.Frame(frame3)
-        self.files_container.pack(fill="both", expand=False)
+        # Current file progress (แสดงเฉพาะไฟล์ที่กำลังทำงาน)
+        tk.Label(frame3, text="ไฟล์ที่กำลังประมวลผล:").pack(pady=5, anchor="w")
+        
+        # สร้าง Canvas + Scrollbar สำหรับแสดง progress bars
+        canvas_frame = tk.Frame(frame3, height=150)
+        canvas_frame.pack(fill="x", padx=5, pady=5)
+        canvas_frame.pack_propagate(False)  # ไม่ให้ขยายตามเนื้อหา
+        
+        self.files_canvas = tk.Canvas(canvas_frame, height=150)
+        scrollbar = tk.Scrollbar(canvas_frame, orient="vertical", command=self.files_canvas.yview)
+        self.files_container = tk.Frame(self.files_canvas)
+        
+        self.files_container.bind(
+            "<Configure>",
+            lambda e: self.files_canvas.configure(scrollregion=self.files_canvas.bbox("all"))
+        )
+        
+        self.files_canvas.create_window((0, 0), window=self.files_container, anchor="nw")
+        self.files_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        self.files_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
         # เก็บ progressbars ของแต่ละไฟล์
         self.file_progress_bars = {}
 
@@ -476,6 +612,142 @@ class VideoConverterApp:
         folder_selected = filedialog.askdirectory()
         if folder_selected:
             var_to_set.set(folder_selected)
+    
+    def browse_file(self, var_to_set):
+        """เลือกไฟล์วิดีโอเดียว"""
+        file_selected = filedialog.askopenfilename(
+            title="เลือกไฟล์วิดีโอ",
+            filetypes=[
+                ("Video files", "*.mp4 *.mov *.mkv *.avi *.webm *.flv"),
+                ("All files", "*.*")
+            ]
+        )
+        if file_selected:
+            var_to_set.set(file_selected)
+    
+    def on_preset_change(self, event=None):
+        """เปลี่ยน encoding settings เมื่อเลือก preset"""
+        preset_name = self.preset_var.get()
+        self.current_encoding_settings = PRESETS[preset_name].copy()
+        self.status_text.insert(tk.END, f"✅ เปลี่ยนโหมด: {preset_name}\n")
+        self.status_text.see(tk.END)
+    
+    def open_advanced_settings(self):
+        """เปิดหน้าต่างตั้งค่าขั้นสูง"""
+        settings_window = tk.Toplevel(self.master)
+        settings_window.title("ตั้งค่าการ Encode ขั้นสูง")
+        settings_window.geometry("500x400")
+        settings_window.resizable(False, False)
+        
+        # Frame หลัก
+        main_frame = tk.Frame(settings_window, padx=20, pady=20)
+        main_frame.pack(fill="both", expand=True)
+        
+        tk.Label(main_frame, text="⚙️ ตั้งค่า FFmpeg Encoder ขั้นสูง", font=("Helvetica", 14, "bold")).pack(pady=(0, 15))
+        
+        # Variables สำหรับ settings
+        quality_var = tk.StringVar(value=self.current_encoding_settings.get("quality") or "")
+        rc_var = tk.StringVar(value=self.current_encoding_settings.get("rc") or "")
+        usage_var = tk.StringVar(value=self.current_encoding_settings.get("usage") or "")
+        preanalysis_var = tk.StringVar(value=self.current_encoding_settings.get("preanalysis") or "")
+        hwaccel_var = tk.StringVar(value=self.current_encoding_settings.get("hwaccel") or "auto")
+        
+        # Quality Setting
+        quality_frame = tk.LabelFrame(main_frame, text="Quality (คุณภาพ)", padx=10, pady=10)
+        quality_frame.pack(fill="x", pady=5)
+        
+        tk.Label(quality_frame, text="Quality Level:").grid(row=0, column=0, sticky="w", pady=2)
+        quality_combo = ttk.Combobox(quality_frame, textvariable=quality_var, 
+                                     values=["", "speed", "balanced", "quality"], state="readonly", width=15)
+        quality_combo.grid(row=0, column=1, padx=5, pady=2)
+        tk.Label(quality_frame, text="(speed=เร็ว, balanced=สมดุล, quality=คุณภาพ)", font=("Arial", 8)).grid(row=1, column=0, columnspan=2, sticky="w")
+        
+        # Rate Control
+        rc_frame = tk.LabelFrame(main_frame, text="Rate Control (การควบคุม Bitrate)", padx=10, pady=10)
+        rc_frame.pack(fill="x", pady=5)
+        
+        tk.Label(rc_frame, text="RC Mode:").grid(row=0, column=0, sticky="w", pady=2)
+        rc_combo = ttk.Combobox(rc_frame, textvariable=rc_var,
+                                values=["", "cbr", "vbr_latency", "vbr_peak", "cqp"], state="readonly", width=15)
+        rc_combo.grid(row=0, column=1, padx=5, pady=2)
+        tk.Label(rc_frame, text="(cbr=คงที่, vbr_latency=เร็ว, vbr_peak=คุณภาพ)", font=("Arial", 8)).grid(row=1, column=0, columnspan=2, sticky="w")
+        
+        # Usage
+        usage_frame = tk.LabelFrame(main_frame, text="Usage (การใช้งาน)", padx=10, pady=10)
+        usage_frame.pack(fill="x", pady=5)
+        
+        tk.Label(usage_frame, text="Usage Mode:").grid(row=0, column=0, sticky="w", pady=2)
+        usage_combo = ttk.Combobox(usage_frame, textvariable=usage_var,
+                                   values=["", "ultralowlatency", "lowlatency", "webcam", "transcoding"], state="readonly", width=15)
+        usage_combo.grid(row=0, column=1, padx=5, pady=2)
+        tk.Label(usage_frame, text="(ultralowlatency=เร็วสุด, transcoding=ปกติ)", font=("Arial", 8)).grid(row=1, column=0, columnspan=2, sticky="w")
+        
+        # Advanced Options
+        adv_frame = tk.LabelFrame(main_frame, text="ตัวเลือกเพิ่มเติม", padx=10, pady=10)
+        adv_frame.pack(fill="x", pady=5)
+        
+        tk.Label(adv_frame, text="Preanalysis:").grid(row=0, column=0, sticky="w", pady=2)
+        preanalysis_combo = ttk.Combobox(adv_frame, textvariable=preanalysis_var,
+                                         values=["", "0", "1"], state="readonly", width=15)
+        preanalysis_combo.grid(row=0, column=1, padx=5, pady=2)
+        
+        tk.Label(adv_frame, text="Hardware Accel:").grid(row=1, column=0, sticky="w", pady=2)
+        hwaccel_combo = ttk.Combobox(adv_frame, textvariable=hwaccel_var,
+                                     values=["", "auto", "dxva2", "d3d11va"], state="readonly", width=15)
+        hwaccel_combo.grid(row=1, column=1, padx=5, pady=2)
+        
+        # ปุ่มบันทึก
+        button_frame = tk.Frame(main_frame)
+        button_frame.pack(pady=(15, 0))
+        
+        def save_settings():
+            self.current_encoding_settings = {
+                "quality": quality_var.get() if quality_var.get() else None,
+                "rc": rc_var.get() if rc_var.get() else None,
+                "usage": usage_var.get() if usage_var.get() else None,
+                "preanalysis": preanalysis_var.get() if preanalysis_var.get() else None,
+                "hwaccel": hwaccel_var.get() if hwaccel_var.get() else None
+            }
+            self.preset_var.set("กำหนดเอง (Custom)")
+            self.status_text.insert(tk.END, "✅ บันทึกการตั้งค่าขั้นสูงแล้ว\n")
+            self.status_text.see(tk.END)
+            settings_window.destroy()
+        
+        def reset_settings():
+            quality_var.set("")
+            rc_var.set("")
+            usage_var.set("")
+            preanalysis_var.set("")
+            hwaccel_var.set("auto")
+        
+        tk.Button(button_frame, text="💾 บันทึก", command=save_settings, bg="green", fg="white", width=12).pack(side="left", padx=5)
+        tk.Button(button_frame, text="🔄 รีเซ็ต", command=reset_settings, width=12).pack(side="left", padx=5)
+        tk.Button(button_frame, text="❌ ยกเลิก", command=settings_window.destroy, width=12).pack(side="left", padx=5)
+    
+    def cancel_conversion(self):
+        """ยกเลิกการแปลงไฟล์"""
+        if self.is_processing:
+            result = messagebox.askyesno(
+                "ยืนยันการยกเลิก",
+                "คุณต้องการยกเลิกการแปลงไฟล์หรือไม่?\n(ไฟล์ที่กำลังทำงานจะถูกหยุด)"
+            )
+            if result:
+                self.stop_event.set()
+                self.status_text.insert(tk.END, "\n⚠️ กำลังยกเลิกการทำงาน...\n")
+                self.cancel_button.config(state=tk.DISABLED)
+    
+    def on_closing(self):
+        """ฟังก์ชันที่ถูกเรียกเมื่อปิดโปรแกรม"""
+        if self.is_processing:
+            result = messagebox.askyesno(
+                "ยืนยันการปิดโปรแกรม",
+                "มีการแปลงไฟล์ที่กำลังทำงานอยู่\nคุณต้องการปิดโปรแกรมหรือไม่?"
+            )
+            if result:
+                self.stop_event.set()  # ส่งสัญญาณให้หยุดทำงาน
+                self.master.after(1000, self.master.destroy)  # รอ 1 วินาทีแล้วปิด
+        else:
+            self.master.destroy()
     
     def check_queue(self):
         """ตรวจสอบ Queue และอัพเดท UI อย่างต่อเนื่อง"""
@@ -493,7 +765,9 @@ class VideoConverterApp:
                     messagebox.showerror(title, message)
                 elif msg_type == "done":
                     self.is_processing = False
+                    self.stop_event.clear()  # รีเซ็ต stop event
                     self.start_button.config(state=tk.NORMAL, text="เริ่มแปลง (Start Conversion)")
+                    self.cancel_button.config(state=tk.DISABLED)
                     self.master.config(cursor="")
                     # รีเซ็ต title
                     self.master.title("Video Bitrate Reducer (GPU/Parallel) - เสร็จสิ้น!")
@@ -504,16 +778,23 @@ class VideoConverterApp:
                     for child in self.files_container.winfo_children():
                         child.destroy()
                     self.file_progress_bars.clear()
-                    # create widgets for each file
-                    for fp in files:
-                        fname = os.path.basename(fp)
+                    
+                    # แสดงเฉพาะไฟล์ที่กำลังทำงาน (สูงสุด max_workers)
+                    # เก็บรายการไฟล์ทั้งหมดไว้
+                    self.active_files = [os.path.basename(fp) for fp in files]
+                    
+                    # สร้าง progress bars สำหรับไฟล์ที่กำลังทำงาน
+                    max_display = min(len(files), int(self.max_workers.get()) if self.max_workers.get().isdigit() else 4)
+                    for i in range(max_display):
+                        fname = f"รอดำเนินการ... ({i+1}/{max_display})"
                         row = tk.Frame(self.files_container)
-                        lbl = tk.Label(row, text=fname, width=40, anchor='w')
+                        lbl = tk.Label(row, text=fname, width=50, anchor='w', font=("Arial", 9))
                         pb = ttk.Progressbar(row, orient='horizontal', length=300, mode='determinate', maximum=100)
                         lbl.pack(side='left', padx=(0,5))
                         pb.pack(side='left', fill='x', expand=True)
                         row.pack(fill='x', pady=2)
-                        self.file_progress_bars[fname] = (lbl, pb)
+                        self.file_progress_bars[i] = (lbl, pb, fname)
+                    
                     # reset overall progress
                     try:
                         self.overall_progress['value'] = 0
@@ -524,19 +805,30 @@ class VideoConverterApp:
                     # title = filename, message = percent
                     fname = title
                     percent = message
-                    if fname in self.file_progress_bars:
-                        lbl, pb = self.file_progress_bars[fname]
-                        try:
-                            pb['value'] = percent
-                            # บังคับให้อัพเดททันที
-                            pb.update_idletasks()
-                        except Exception:
-                            pass
-                        # update label to show percent
-                        try:
-                            lbl.config(text=f"{fname} - {percent}%")
-                        except Exception:
-                            pass
+                    
+                    # อัปเดต progress bar ที่ว่าง หรือที่กำลังแสดงไฟล์นี้อยู่
+                    updated = False
+                    for idx, (lbl, pb, current_fname) in self.file_progress_bars.items():
+                        if current_fname == fname or "รอดำเนินการ" in current_fname:
+                            try:
+                                pb['value'] = percent
+                                pb.update_idletasks()
+                                lbl.config(text=f"{fname} - {percent}%")
+                                self.file_progress_bars[idx] = (lbl, pb, fname)
+                                updated = True
+                                break
+                            except Exception:
+                                pass
+                    
+                    # ถ้าไฟล์เสร็จแล้ว (100%) ให้รีเซ็ตช่องนั้นเป็น "เสร็จสิ้น"
+                    if percent == 100:
+                        for idx, (lbl, pb, current_fname) in self.file_progress_bars.items():
+                            if current_fname == fname:
+                                try:
+                                    lbl.config(text=f"✅ {fname} - เสร็จสิ้น")
+                                except Exception:
+                                    pass
+                                break
                 elif msg_type == 'overall_progress':
                     overall = message
                     try:
@@ -563,19 +855,43 @@ class VideoConverterApp:
             messagebox.showwarning("กำลังทำงาน", "กรุณารอให้การแปลงปัจจุบันเสร็จสิ้นก่อน")
             return
         
+        input_path = self.input_folder.get()
+        
+        # ตรวจสอบว่าเป็นไฟล์หรือโฟลเดอร์
+        if not input_path:
+            messagebox.showerror("Error", "กรุณาเลือก Input Folder หรือ File")
+            return
+        
+        # ถ้าเป็นไฟล์ ให้แปลงเป็นโฟลเดอร์และสร้าง temp list
+        if os.path.isfile(input_path):
+            # ใช้โฟลเดอร์เดียวกับไฟล์เป็น input folder
+            input_folder = os.path.dirname(input_path)
+            # เก็บชื่อไฟล์ไว้เพื่อกรองในภายหลัง
+            self.single_file_mode = os.path.basename(input_path)
+        elif os.path.isdir(input_path):
+            input_folder = input_path
+            self.single_file_mode = None
+        else:
+            messagebox.showerror("Error", "Input path ไม่ถูกต้อง")
+            return
+        
         # ล้างข้อความเก่า
         self.status_text.delete(1.0, tk.END)
+        
+        # รีเซ็ต stop event
+        self.stop_event.clear()
         
         # เปลี่ยนสถานะปุ่ม
         self.is_processing = True
         self.start_button.config(state=tk.DISABLED, text="กำลังแปลง... (Processing)")
+        self.cancel_button.config(state=tk.NORMAL)
         self.master.config(cursor="wait")
         
         # รันการแปลงใน Thread ใหม่
         self.conversion_thread = threading.Thread(
-            target=start_conversion,
+            target=self.start_conversion_wrapper,
             args=(
-                self.input_folder.get(),
+                input_folder,
                 self.output_folder.get(),
                 self.reduction_percent.get(),
                 self.max_workers.get(),
@@ -584,6 +900,19 @@ class VideoConverterApp:
             daemon=True
         )
         self.conversion_thread.start()
+    
+    def start_conversion_wrapper(self, input_folder, output_folder, reduction_percent, max_workers, message_queue):
+        """Wrapper สำหรับ start_conversion เพื่อจัดการกับโหมดไฟล์เดียว"""
+        # ถ้าเป็นโหมดไฟล์เดียว ให้กรองไฟล์ก่อน
+        if hasattr(self, 'single_file_mode') and self.single_file_mode:
+            # สร้างรายการไฟล์ชั่วคราวเฉพาะไฟล์ที่เลือก
+            import tempfile
+            import shutil
+            
+            # แจ้งว่ากำลังประมวลผลไฟล์เดียว
+            message_queue.put(("text", f"โหมดไฟล์เดียว: {self.single_file_mode}\n", None))
+            
+        start_conversion(input_folder, output_folder, reduction_percent, max_workers, message_queue, self.stop_event, self.current_encoding_settings)
 
 
 if __name__ == "__main__":
